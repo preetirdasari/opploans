@@ -1,0 +1,316 @@
+---
+title: "ML Challenge - OppLoans"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Required Libraries ###
+
+```{r, include=FALSE}
+setwd("~/Desktop/Git/OppLoans")
+require(readxl)
+require(dplyr)        # data wrangling
+require(tidyr)
+require(ROSE)         # data balancing
+require(ggplot2)
+require(xgboost)
+require(caret)
+require(gridExtra)
+require(car)
+require(mltools)
+require(data.table)
+require(reshape2)
+```
+
+### Importing Data ###
+
+
+```{r}
+ds <- read.csv("Lending_Club_v2.csv")
+org <- read.csv("Lending_Club_v2.csv")
+dict <- read_excel("LCDataDictionary.xlsx")
+```
+
+### Creating Target Variable ### 
+```{r}
+ds$loan_status <- as.factor(ds$loan_status)
+levels(ds$loan_status)
+```
+
+Loan status has the levels: "Charged Off", "Does not meet the credit policy. Status:Charged Off", "Does not meet the credit policy. Status:Fully Paid" and "Fully Paid". The first two levels qualify for `bad_indicators`
+
+
+```{r}
+bad_indicators <- c("Charged Off", "Does not meet the credit policy. Status:Charged Off") 
+ds$target <- ifelse(ds$loan_status %in% bad_indicators,1,0)
+ds$target <- as.factor(ds$target)
+```
+
+
+### Converting Percentages ### 
+
+```{r}
+ds$int_rate <- as.numeric(sub("%","",ds$int_rate))/100
+ds$revol_util <- as.numeric(sub("%","",ds$revol_util))/100
+```
+
+## Removing some features ## 
+
+Columns with 1% or less missing rows were removed, as well as columns with descriptions, such as `id`, `desc`. 
+
+```{r}
+nas <- data.frame(names(ds), colSums(is.na(ds)))  #tabulating variables with nas
+ds <- ds[,colSums(is.na(ds))<(0.01*nrow(ds))]    #with deleted columns 
+drops <- c("id","desc","title", "next_pymnt_d", "emp_title", "application_type", "zip_code", "addr_state", "debt_settlement_flag_date", "settlement_status", "settlement_date", "initial_list_status")
+ds <- ds[ , !(names(ds) %in% drops)]
+```
+
+## EDA ##
+
+```{r}
+summary(ds)
+```
+
+```{r}
+p1 <- ggplot(ds) + aes(x=target, fill=target) + geom_bar(stat="count", color="black", width = 0.6) +
+       xlab("Loan Default") + ylab("ncount")
+p1
+```
+
+```{r}
+p2 <- ggplot(ds) + aes(x=purpose, y=int_rate, fill=as.factor(target)) + geom_bar(stat="identity", width = 0.6, position="dodge") +
+       xlab("Loan Default") + ylab("ncount")
+p2
+```
+(When interest rates are higher for car, renewable energy loans, they tend to default.)
+
+### Funded Amount, Interest Received and Grade by Target ###
+
+```{r}
+p3 = ggplot(ds) + aes(x=grade, y=int_rate, fill=target) +   geom_boxplot() + 
+     xlab("Interest Rate") + ylab("Loan Grade")
+p3
+
+p4 = ggplot(ds) + aes(x=grade, y=funded_amnt, fill=target) +   geom_boxplot() + 
+     xlab("Funded Amount") + ylab("Loan Grade")
+p4
+
+grid.arrange(p3, p4, nrow=2)
+
+
+```
+
+### Funded Amount and Interest Received by Target ###
+
+```{r,warning=FALSE}
+p5 = ggplot(ds, aes(x=funded_amnt, y=total_rec_int, fill=target)) + geom_bar(stat="identity", position="dodge") + scale_x_binned()
+p5 = p5 + xlab("Funded Amount") + ylab("Interest Received to Date")
+
+p5
+```
+### Distribution of sample varaibles ### 
+
+```{r, warning=FALSE}
+set.seed(006)
+ds.plot <- select_if(ds, is.numeric)
+
+ds.hist <- ds.plot[sample(ncol(ds.plot),20)]
+ds.hist <- gather(ds.hist, cols, value) 
+
+p6 <- ggplot(ds.hist, aes(value)) +
+    facet_wrap(~ cols, scales = "free") +
+    geom_histogram(bins=40, fill="lightblue") 
+p6
+```
+
+## Feature Reduction ##
+
+### Correlation Matrix for the remaining variables ### 
+
+```{r, warning=TRUE}
+ds_cor <- ds[,-46] %>% mutate_if(is.character, as.factor)
+ds_cor <- ds_cor %>% mutate_if(is.factor, as.numeric) # converting to numeric for corr matrix
+cor <- cor(ds_cor, use="pairwise.complete.obs")
+cor[lower.tri(cor,diag=TRUE)] <- NA  # removing duplicates and perfect correlations
+cor.table <- as.data.frame(as.table(cor)) # data table with variables and correlation
+cor.table[cor.table == 1] <- NA 
+cor.table <- subset(cor.table, abs(Freq) > 0.70) # studying variables that have correlation higher than |0.70|
+
+```
+
+```{r}
+drop_2 <- unique(cor.table$Var1)
+ds <- ds[ , !(names(ds) %in% drop_2)]
+```
+
+## Transforming characters and factors into numeric ##
+
+```{r}
+ds_str <- select_if(ds, is.character)   # df with character variables
+ds_num <- select_if(ds, is.numeric)     # df with numeric variables
+ds_str <- ds_str %>% mutate_if(is.character, as.factor)
+sum <- summary(ds_str)
+ds_str <- ds_str[c(1:4,6:7,11:12)]      # dropping variables with more than 10 factor levels
+ds_1h <- one_hot(as.data.table(ds_str)) # one hot encoding all the categorical variables
+ds_trnsfr <- data.frame(ds_1h)
+
+ds <- data.frame(ds$target, ds_trnsfr, ds_num)  # new df with one hot coded variables
+```
+
+## XGBoost Run Zero for Feature Selection ## 
+
+### Splitting data ###
+```{r}
+set.seed(123)
+
+train = ds %>%
+  sample_n(29776)    # training set with 70% of nrows
+test = ds %>%
+  setdiff(train)
+
+X.train <- data.matrix(train[,-1])
+
+y.train <- train %>%
+           select(ds.target) %>%
+           unlist() %>%
+           as.numeric(as.character())
+y.train <- y.train - 1    # when converting to numeric, labels were turning to 1, 2. So, y.train - 1
+
+
+X.test <- data.matrix(test[,-1])
+
+y.test <- test %>%
+           select(ds.target) %>%
+           unlist() %>%
+            as.numeric(as.character())
+y.test <- y.test - 1
+
+
+```
+
+### Fitting XGBoost model ###
+
+```{r}
+xgbst <- xgboost(data = X.train, label = y.train, nrounds = 20)
+
+imp.mat <- xgb.importance(feature_names = colnames(X.train),model = xgbst) 
+xgb.plot.importance(importance_matrix = imp.mat[1:15]) 
+imp.ftrs <- (imp.mat$Feature[1:10])
+
+imp.ftrs
+```
+
+## XGBoost Run One ## 
+
+## Fitting XGBoost with Important Features ## 
+
+```{r}
+
+ds.imp <- data.frame(ds$ds.target, ds[ , (names(ds) %in% imp.ftrs)])  # ds with imp features
+names(ds.imp)[names(ds.imp)=="ds.ds.target"] <- "target"
+
+  
+set.seed(124)
+
+train1 = ds.imp %>%
+  sample_n(29776)    # training set with 70% of nrows
+test1 = ds.imp %>%
+  setdiff(train1)
+
+X.train1 <- data.matrix(train1[,-1])
+y.train1 <- train1 %>%
+           select(target) %>%
+           unlist() %>%
+           as.numeric(as.character())
+
+y.train1 <- y.train1 - 1  # when converting to numeric, labels were turning to 1, 2. So, y.train - 1
+
+
+X.test1 <- data.matrix(test1[,-1])
+y.test1 <- test1 %>%
+           select(target) %>%
+           unlist() %>%
+            as.numeric(as.character())
+
+y.test1 <- y.test1 - 1
+```
+
+# Fitting xgboost_cv with selected features ## 
+
+To get an accurate measure of error and compare auc trends for train and test sets:
+
+```{r}
+
+xgb_cv = xgb.cv(data = X.train1, 
+                label = y.train1, 
+                nfold = 10,
+                eta=0.01, 
+                nrounds = 20,
+                prediction = TRUE,
+                eval_metric="auc"
+)
+```
+
+## Plotting  AUC for the training and testing sets ##
+
+```{r}
+
+xgb_auc <- xgb_cv$evaluation_log[,c(1,2,4)]  # extracing auc means for train and test sets 
+xgb_auc  <- melt(xgb_auc , id.vars=1)
+
+p_auc <- ggplot(xgb_auc, aes(x=iter, y=value, group = variable, color = variable))  + geom_line() 
+p_auc <- p_auc + xlab("Iteration Number") + ylab("AUC")
+p_auc
+```
+The plot shows the trends of AUC curves for both train and test sets are comparable. 
+
+## Fitting XGBoost with CV parameters  ##
+
+Fitting final model using learning rate and number of rounds from CV model:
+
+```{r}
+xgbst_1 <- xgboost(data = X.train1, 
+                   label = y.train1, 
+                   eta=0.01, 
+                   nrounds = 20,
+                   eval_metric="auc"
+                   )
+```
+
+### Precision and Recall for final model ###
+
+```{r}
+
+error_rates <- matrix(0, nrow = 2, ncol = 3)
+error_rates[,1] <- c("Recall", "Precision")
+colnames(error_rates) <- c("Measure", "Train", "Test")
+
+y.train.hat <- ifelse(predict(xgbst_1, X.train1) > 0.5, 1, 0)
+train.preds <- table(y.train.hat, y.train1)
+
+error_rates[1,2] <- train.preds[1]/(train.preds[1]+train.preds[2])  ## Training Recall Rate
+error_rates[2,2] <- train.preds[1]/(train.preds[1]+train.preds[3])  ## Training Precision Rate
+
+
+y.test.hat <- ifelse(predict(xgbst_1, X.test1) > 0.5, 1, 0)
+test.preds <- table(y.test.hat, y.test1)
+
+error_rates[1,3] <- test.preds[1]/(test.preds[1]+test.preds[2])  ## Testing Recall Rate
+error_rates[2,3] <- test.preds[1]/(test.preds[1]+test.preds[3])  ## Testing Precision Rate
+
+data.frame(error_rates)
+```
+
+### Plotting  AUC for Final Model ###
+
+```{r}
+final_auc <- xgbst_1$evaluation_log
+
+p_auc1 <- ggplot(final_auc, aes(x=iter, y=train_auc)) + geom_line() 
+p_auc1 <- p_auc1 + xlab("Iteration Number") + ylab("AUC")
+p_auc1
+```
+
